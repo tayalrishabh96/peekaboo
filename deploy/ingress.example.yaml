@@ -1,0 +1,26 @@
+# Internal ingress restricted to specific source IPs. Adjust the ingressClass,
+# host, and allowlist to your environment. This example uses ingress-nginx
+# annotations; translate if you use a different controller.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kube-forwarder
+  annotations:
+    # Comma-separated CIDRs allowed to reach this ingress. Everything else 403s.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,192.168.0.0/16"
+    # Proxied services may stream / take a while; relax timeouts a little.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: kube-forwarder.internal.example.com # <-- change me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-forwarder
+                port:
+                  number: 80

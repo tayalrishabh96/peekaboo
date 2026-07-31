@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-forwarder
+  labels:
+    app: kube-forwarder
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-forwarder
+  template:
+    metadata:
+      labels:
+        app: kube-forwarder
+    spec:
+      containers:
+        - name: kube-forwarder
+          # Replace with your pushed image ref.
+          image: REGISTRY/kube-forwarder:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8770
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:8770"
+            # Reverse-proxy to in-cluster services over cluster DNS instead of
+            # kubectl port-forward, so browser traffic returns through this one
+            # HTTP port (works behind the ingress).
+            - name: FORWARD_MODE
+              value: "proxy"
+            - name: KUBECONFIG
+              value: "/etc/kube/config"
+            # kubectl writes discovery/HTTP cache under $HOME; point it at a
+            # writable emptyDir since the root filesystem is read-only.
+            - name: HOME
+              value: "/tmp"
+          volumeMounts:
+            - name: kubeconfig
+              mountPath: /etc/kube
+              readOnly: true
+            - name: cache
+              mountPath: /tmp
+          readinessProbe:
+            httpGet:
+              path: /api/contexts
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: kubeconfig
+          secret:
+            secretName: kube-forwarder-kubeconfig
+            items:
+              - key: config
+                path: config
+        - name: cache
+          emptyDir: {}

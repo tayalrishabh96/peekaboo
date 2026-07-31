@@ -1,0 +1,7 @@
+**/node_modules
+backend/web/assets
+backend/web/index.html
+backend/kube-forwarder
+kube-forwarder
+.git
+*.log
