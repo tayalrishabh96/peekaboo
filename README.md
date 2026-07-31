@@ -67,12 +67,12 @@ Open the URL Vite prints (http://127.0.0.1:5183).
 
 ## Deploy to Kubernetes (proxy mode)
 
-The app runs **inside the target cluster** (e.g. the cd.devtron.ai cluster) and
+The app runs **inside the target cluster** (e.g. the cd.example.com cluster) and
 talks to the API using a mounted, restricted kubeconfig. Manifests live in
 [`deploy/`](deploy/).
 
 ```bash
-# 1. Build and push the image (your CI/Devtron can do this too).
+# 1. Build and push the image (your CI can do this too).
 docker build -t REGISTRY/kube-forwarder:TAG .
 docker push  REGISTRY/kube-forwarder:TAG
 # then set that image ref in deploy/deployment.yaml
