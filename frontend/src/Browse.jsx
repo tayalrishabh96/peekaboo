@@ -189,11 +189,13 @@ export default function Browse({ onForwardStarted, config }) {
   const nsForbidden = errors.ns && /forbidden|403/i.test(errors.ns)
 
   async function startForward(svc, port) {
-    // In proxy mode the pod reverse-proxies directly to the in-cluster service;
-    // just open the proxy URL in a new tab. No process to start.
+    // In proxy mode the app reverse-proxies through the selected cluster's API
+    // server to the service; just open the proxy URL in a new tab.
     if (proxyMode) {
       const prefix = config?.proxyPrefix || '/proxy/'
-      const url = `${prefix}${encodeURIComponent(namespace)}/${encodeURIComponent(svc.name)}/${port.port}/`
+      const url =
+        `${prefix}${encodeURIComponent(context)}/${encodeURIComponent(namespace)}` +
+        `/${encodeURIComponent(svc.name)}/${port.port}/`
       window.open(url, '_blank', 'noopener')
       return
     }

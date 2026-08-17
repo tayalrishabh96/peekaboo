@@ -6,25 +6,44 @@ modes:
 
 - **`portforward` (local, default):** shells out to `kubectl port-forward` and
   gives you a `localhost:PORT`. This is the local-dev experience.
-- **`proxy` (in-cluster):** reverse-proxies your browser straight to the
-  in-cluster service over cluster DNS
-  (`service.namespace.svc.cluster.local:port`). No port-forward — traffic
-  returns through the app's single HTTP port, so it works behind an ingress.
+- **`proxy` (hosted):** reverse-proxies your browser to the service **through
+  the selected cluster's API server** (the `services/proxy` subresource). This
+  reaches services in *any* cluster the mounted kubeconfig can talk to — not
+  just the cluster the pod runs in — and returns through the app's single HTTP
+  port, so it works behind one ingress.
 
 The mode is set with the `FORWARD_MODE` env var and the UI adapts to it.
 
-- **Backend**: Go (stdlib only). Uses `kubectl` for *listing*; the proxy is
-  pure Go (`httputil.ReverseProxy`).
+- **Backend**: Go (stdlib only). Uses `kubectl` for *listing*; proxy mode builds
+  the authenticated API-server request directly (`httputil.ReverseProxy` + the
+  kubeconfig's server URL and token).
 - **Frontend**: React + Vite, embedded into the Go binary at build time.
 
 ## Why two modes
 
 `kubectl port-forward` binds the forwarded port to the machine running it. On
 your laptop that's reachable; inside a pod it binds to the *pod's* localhost,
-which a remote browser can't reach. When the app runs **in the same cluster** as
-the services, it doesn't need a forward at all — it can dial the service
-directly and relay the response. That's proxy mode, and it's the right model for
-the hosted deployment.
+which a remote browser can't reach.
+
+Proxy mode instead routes each request through the API server's service-proxy
+subresource: `GET {apiserver}/api/v1/namespaces/{ns}/services/{svc}:{port}/proxy/...`.
+Because it uses the same API endpoint the kubeconfig already talks to, it works
+across clusters (including through a management proxy such as a Devtron
+`.../orchestrator/k8s/proxy/cluster/<name>` server URL). The request is built in
+Go so we control the headers — in particular we omit `X-Forwarded-For`, which
+some API gateways reject when it carries a loopback/private IP.
+
+### RBAC for proxy mode
+
+The token in the mounted kubeconfig needs the **`services/proxy`** subresource,
+which the built-in `view` ClusterRole does *not* grant. Add it, scoped to the
+namespaces you expose:
+
+```yaml
+apiGroups: [""]
+resources: ["services/proxy"]
+verbs: ["get", "create"]
+```
 
 ## Requirements
 
@@ -109,7 +128,7 @@ Notes on the manifests:
 | `GET /api/contexts` | kubeconfig contexts (shown as "clusters") |
 | `GET /api/namespaces?context=` | namespaces in a context |
 | `GET /api/services?context=&namespace=` | services + their ports |
-| `GET /proxy/{ns}/{svc}/{port}/...` | **proxy mode:** reverse-proxy to the service |
+| `GET /proxy/{context}/{ns}/{svc}/{port}/...` | **proxy mode:** proxy to the service via that context's API server |
 | `POST /api/forwards` | **portforward mode:** start a `kubectl port-forward` |
 | `GET /api/forwards` | list running forwards |
 | `DELETE /api/forwards/{id}` | stop a forward |
@@ -118,18 +137,22 @@ In **portforward mode**, local port is left to `0` so `kubectl` picks a free
 port; the backend parses kubectl's `Forwarding from 127.0.0.1:PORT` line and
 reports it to the UI. Forwards are in-memory: stopping the server stops them.
 
-In **proxy mode**, clicking a port opens `/proxy/{ns}/{svc}/{port}/` in a new
-tab and the app relays the request to the service.
+In **proxy mode**, clicking a port opens
+`/proxy/{context}/{ns}/{svc}/{port}/` in a new tab; the app looks up that
+context's server URL + token from the kubeconfig and relays the request through
+the API server's service-proxy subresource. Ports 443/6443/8443/9443 are
+proxied as HTTPS upstreams; everything else as HTTP.
 
 ## Limitations
 
-- **Proxy mode is HTTP/HTTPS only.** A browser reverse-proxy can't tunnel raw
-  TCP protocols (Postgres, Redis, gRPC-over-h2c without TLS handling, etc.).
+- **Proxy mode is HTTP/HTTPS only.** The service-proxy subresource speaks HTTP;
+  it can't tunnel raw TCP protocols (Postgres, Redis, plain gRPC, etc.).
   Non-HTTP services are listed but won't render usefully when proxied.
-- **Proxy mode only reaches services in the pod's own cluster** — that's what
-  cluster DNS resolves. Selecting a service from a *different* kubeconfig
-  context in the list is fine for browsing, but proxying assumes it lives in the
-  cluster the pod runs in.
+- **Proxy mode needs the `services/proxy` RBAC verb** on the token (see above);
+  the built-in `view` role doesn't include it.
+- **Exec-plugin auth isn't supported in proxy mode** — the direct request path
+  handles bearer tokens and client certs from the kubeconfig, not `exec`
+  credential plugins.
 - **No built-in auth.** In-cluster the `Service` is ClusterIP-only; put an
   IP-restricted ingress (or SSO) in front before exposing it.
 - Selectorless services (e.g. the default `kubernetes` service) can't be
