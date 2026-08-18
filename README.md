@@ -143,6 +143,24 @@ context's server URL + token from the kubeconfig and relays the request through
 the API server's service-proxy subresource. Ports 443/6443/8443/9443 are
 proxied as HTTPS upstreams; everything else as HTTP.
 
+### Sub-path apps (e.g. Grafana)
+
+Some apps are configured to live at a fixed base path — Grafana with
+`serve_from_sub_path: true` and `root_url: https://host/grafana/` insists on
+being served under `/grafana/` and redirects everything else there. To make
+these work under the proxy prefix, proxy mode does **best-effort** response
+rewriting:
+
+- redirect `Location` headers are pulled back under the proxy prefix (so the
+  browser isn't bounced to the app's external `root_url`);
+- in HTML responses, the API server's own service-proxy base path is translated
+  to the proxy prefix, and Grafana's `appSubUrl` (in bootData) is prefixed too;
+- `Set-Cookie` `Path` is rewritten to the proxy prefix.
+
+This is best-effort: it covers redirects, HTML asset/API links, and cookies, but
+not every URL an SPA may build at runtime (some live/WebSocket features may still
+misbehave). Verified working for Grafana 11.x served this way.
+
 ## Limitations
 
 - **Proxy mode is HTTP/HTTPS only.** The service-proxy subresource speaks HTTP;

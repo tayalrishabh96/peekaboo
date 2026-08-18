@@ -1,18 +1,50 @@
 package kube
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+)
+
+// ctxKey is the type for values stashed in the request context.
+type ctxKey int
+
+// metaKey holds per-request rewrite info so ModifyResponse can map upstream
+// URLs back into our proxy prefix.
+const metaKey ctxKey = 0
+
+// proxyMeta carries the two path strings ModifyResponse needs:
+//   prefix  — browser-facing base, /proxy/{ctx}/{ns}/{svc}/{port}
+//   apiBase — the API server's own service-proxy base,
+//             /api/v1/namespaces/{ns}/services/{svcRef}/proxy
+// The API server rewrites absolute links in proxied HTML to start with apiBase;
+// we translate that back to prefix so the browser stays within peekaboo.
+type proxyMeta struct {
+	prefix  string
+	apiBase string
+}
+
+// Rewrite patterns for making a sub-path app (e.g. Grafana with an absolute
+// root_url + serve_from_sub_path) work under our proxy prefix. Best-effort:
+// covers the common HTML/redirect/cookie cases, not every runtime-built URL.
+var (
+	// Grafana embeds its base path as "appSubUrl":"/grafana" in bootData JSON;
+	// the API server does not rewrite this, so we prepend the prefix ourselves.
+	reAppSubURL = regexp.MustCompile(`("appSubUrl"\s*:\s*")(/[^"]*)`)
+	// Set-Cookie Path attribute.
+	reCookiePath = regexp.MustCompile(`(?i)(;\s*[Pp]ath=)(/[^;]*)`)
 )
 
 // ProxyPrefix is the URL path under which service traffic is reverse-proxied:
@@ -49,7 +81,7 @@ func (p *ServiceProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "expected /proxy/{context}/{namespace}/{service}/{port}/...", http.StatusBadRequest)
 		return
 	}
-	context := unescape(parts[0])
+	ctxName := unescape(parts[0])
 	namespace := unescape(parts[1])
 	service := unescape(parts[2])
 	port, err := strconv.Atoi(parts[3])
@@ -62,11 +94,16 @@ func (p *ServiceProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		subPath = parts[4]
 	}
 
-	rp, err := p.proxyFor(context)
+	rp, err := p.proxyFor(ctxName)
 	if err != nil {
-		http.Error(w, "cannot reach API server for context "+context+": "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "cannot reach API server for context "+ctxName+": "+err.Error(), http.StatusBadGateway)
 		return
 	}
+
+	// The browser-facing prefix for this service, so redirects/HTML that the
+	// upstream emits relative to its own root get rewritten to stay in-proxy.
+	// (k8s names are DNS-safe, so the decoded parts equal their escaped form.)
+	prefix := ProxyPrefix + parts[0] + "/" + parts[1] + "/" + parts[2] + "/" + parts[3]
 
 	// Rewrite the request path to the API-server service-proxy subresource:
 	//   /api/v1/namespaces/{ns}/services/[https:]{svc}:{port}/proxy/{sub}
@@ -74,8 +111,10 @@ func (p *ServiceProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if httpsProxyPorts[port] {
 		svcRef = "https:" + svcRef
 	}
-	r.URL.Path = fmt.Sprintf("/api/v1/namespaces/%s/services/%s/proxy/%s", namespace, svcRef, subPath)
+	apiBase := fmt.Sprintf("/api/v1/namespaces/%s/services/%s/proxy", namespace, svcRef)
+	r.URL.Path = apiBase + "/" + subPath
 	r.URL.RawPath = ""
+	r = r.WithContext(context.WithValue(r.Context(), metaKey, proxyMeta{prefix: prefix, apiBase: apiBase}))
 	rp.ServeHTTP(w, r)
 }
 
@@ -115,8 +154,11 @@ func (p *ServiceProxy) proxyFor(context string) (*httputil.ReverseProxy, error) 
 		}
 		// Do NOT forward X-Forwarded-For — gateways reject loopback/private IPs.
 		req.Header["X-Forwarded-For"] = nil
+		// Ask for uncompressed responses so we can rewrite HTML bodies.
+		req.Header.Del("Accept-Encoding")
 		req.Host = target.Host
 	}
+	rp.ModifyResponse = rewriteResponse
 	rp.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, e error) {
 		http.Error(rw, "proxy error: "+e.Error(), http.StatusBadGateway)
 	}
@@ -132,6 +174,98 @@ func unescape(s string) string {
 		return v
 	}
 	return s
+}
+
+// rewriteResponse makes upstream apps that assume they're served at their own
+// root (redirects, absolute-path assets, Grafana's appSubUrl, cookie Path) work
+// when served under our proxy prefix. Best-effort: HTML + redirects + cookies.
+//
+// The API server already rewrites absolute links in proxied HTML/redirects to
+// start with its own service-proxy base (apiBase); we translate apiBase back to
+// our browser-facing prefix. Grafana's appSubUrl (in bootData JSON) is not
+// touched by the API server, so we prepend the prefix to it separately.
+func rewriteResponse(resp *http.Response) error {
+	meta, _ := resp.Request.Context().Value(metaKey).(proxyMeta)
+	if meta.prefix == "" {
+		return nil
+	}
+	prefix, apiBase := meta.prefix, meta.apiBase
+
+	// 1) Redirects.
+	if loc := resp.Header.Get("Location"); loc != "" {
+		resp.Header.Set("Location", rewriteLocation(loc, prefix, apiBase))
+	}
+
+	// 2) Cookie Path so the browser keeps sending them under our prefix.
+	if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
+		rewritten := make([]string, len(cookies))
+		for i, c := range cookies {
+			c = strings.ReplaceAll(c, apiBase, prefix)
+			c = reCookiePath.ReplaceAllStringFunc(c, func(m string) string {
+				sub := reCookiePath.FindStringSubmatch(m)
+				if strings.HasPrefix(sub[2], prefix) {
+					return m
+				}
+				return sub[1] + prefix + sub[2]
+			})
+			rewritten[i] = c
+		}
+		resp.Header.Del("Set-Cookie")
+		for _, c := range rewritten {
+			resp.Header.Add("Set-Cookie", c)
+		}
+	}
+
+	// 3) HTML body.
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+		return nil
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return err
+	}
+	s := string(body)
+	s = strings.ReplaceAll(s, apiBase, prefix) // API-server-rewritten links -> our prefix
+	s = reAppSubURL.ReplaceAllStringFunc(s, func(m string) string {
+		sub := reAppSubURL.FindStringSubmatch(m)
+		if strings.HasPrefix(sub[2], prefix) {
+			return m
+		}
+		return sub[1] + prefix + sub[2]
+	})
+
+	resp.Body = io.NopCloser(strings.NewReader(s))
+	resp.ContentLength = int64(len(s))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(s)))
+	resp.Header.Del("Content-Encoding") // body is now plain text
+	return nil
+}
+
+// rewriteLocation maps a redirect Location back into our proxy prefix.
+func rewriteLocation(loc, prefix, apiBase string) string {
+	// Already an API-server-relative path -> swap its base for ours.
+	if strings.Contains(loc, apiBase) {
+		return strings.ReplaceAll(loc, apiBase, prefix)
+	}
+	u, err := url.Parse(loc)
+	if err != nil {
+		return loc
+	}
+	// Same-path already under our prefix: leave it.
+	if strings.HasPrefix(u.Path, prefix) {
+		return loc
+	}
+	// Absolute (e.g. Grafana's root_url on another host) or root-relative:
+	// keep just the path+query and move it under our prefix.
+	if strings.HasPrefix(u.Path, "/") {
+		nl := prefix + u.Path
+		if u.RawQuery != "" {
+			nl += "?" + u.RawQuery
+		}
+		return nl
+	}
+	return loc
 }
 
 // restConfig is the minimal connection info for one context.
