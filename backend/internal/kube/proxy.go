@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,10 +42,14 @@ type proxyMeta struct {
 // covers the common HTML/redirect/cookie cases, not every runtime-built URL.
 var (
 	// Grafana embeds its base path as "appSubUrl":"/grafana" in bootData JSON;
-	// the API server does not rewrite this, so we prepend the prefix ourselves.
+	// neither path rewrites this, so we prepend the prefix ourselves.
 	reAppSubURL = regexp.MustCompile(`("appSubUrl"\s*:\s*")(/[^"]*)`)
 	// Set-Cookie Path attribute.
 	reCookiePath = regexp.MustCompile(`(?i)(;\s*[Pp]ath=)(/[^;]*)`)
+	// Absolute-path attribute values href="/x", src="/x", action="/x" (single
+	// leading slash, so protocol-relative //host is left alone). Used in tunnel
+	// mode, where the upstream is the app directly (no API-server rewriting).
+	reAttrAbsPath = regexp.MustCompile(`(?i)((?:href|src|action)=["'])(/[^/][^"']*)`)
 )
 
 // ProxyPrefix is the URL path under which service traffic is reverse-proxied:
@@ -62,15 +67,47 @@ const ProxyPrefix = "/proxy/"
 // API server dials the backend over TLS. Everything else defaults to http.
 var httpsProxyPorts = map[int]bool{443: true, 6443: true, 8443: true, 9443: true}
 
-// ServiceProxy reverse-proxies browser requests to cluster services through the
-// selected context's API server.
+// ServiceProxy reverse-proxies browser requests to cluster services. By default
+// it routes through the selected context's API server (service-proxy). Services
+// matching a tunnel pattern instead go through a port-forward tunnel, which
+// supports all HTTP methods without Admin RBAC.
 type ServiceProxy struct {
-	mu    sync.Mutex
-	byCtx map[string]*httputil.ReverseProxy
+	mu             sync.Mutex
+	byCtx          map[string]*httputil.ReverseProxy
+	tunnelPatterns []string
+	tunnels        *tunnelManager
 }
 
-func NewServiceProxy() *ServiceProxy {
-	return &ServiceProxy{byCtx: make(map[string]*httputil.ReverseProxy)}
+// NewServiceProxy builds the proxy. tunnelServices is a comma-separated list of
+// glob patterns (matched against "service" or "namespace/service") whose
+// traffic should go through a port-forward tunnel instead of the API server.
+func NewServiceProxy(tunnelServices string) *ServiceProxy {
+	var pats []string
+	for _, p := range strings.Split(tunnelServices, ",") {
+		if s := strings.TrimSpace(p); s != "" {
+			pats = append(pats, s)
+		}
+	}
+	return &ServiceProxy{
+		byCtx:          make(map[string]*httputil.ReverseProxy),
+		tunnelPatterns: pats,
+		tunnels:        newTunnelManager(),
+	}
+}
+
+// shouldTunnel reports whether a service is configured to use a port-forward
+// tunnel. A pattern containing "/" matches "namespace/service", else "service".
+func (p *ServiceProxy) shouldTunnel(ns, svc string) bool {
+	for _, pat := range p.tunnelPatterns {
+		target := svc
+		if strings.Contains(pat, "/") {
+			target = ns + "/" + svc
+		}
+		if ok, _ := path.Match(pat, target); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // ServeHTTP handles /proxy/{context}/{namespace}/{service}/{port}/{rest...}.
@@ -94,16 +131,23 @@ func (p *ServiceProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		subPath = parts[4]
 	}
 
+	// The browser-facing prefix for this service, so redirects/HTML that the
+	// upstream emits relative to its own root get rewritten to stay in-proxy.
+	// (k8s names are DNS-safe, so the decoded parts equal their escaped form.)
+	prefix := ProxyPrefix + parts[0] + "/" + parts[1] + "/" + parts[2] + "/" + parts[3]
+
+	// Services configured for tunneling go through a port-forward (all HTTP
+	// methods work without Admin RBAC); everything else uses the API server.
+	if p.shouldTunnel(namespace, service) {
+		p.serveTunnel(w, r, ctxName, namespace, service, port, subPath, prefix)
+		return
+	}
+
 	rp, err := p.proxyFor(ctxName)
 	if err != nil {
 		http.Error(w, "cannot reach API server for context "+ctxName+": "+err.Error(), http.StatusBadGateway)
 		return
 	}
-
-	// The browser-facing prefix for this service, so redirects/HTML that the
-	// upstream emits relative to its own root get rewritten to stay in-proxy.
-	// (k8s names are DNS-safe, so the decoded parts equal their escaped form.)
-	prefix := ProxyPrefix + parts[0] + "/" + parts[1] + "/" + parts[2] + "/" + parts[3]
 
 	// Rewrite the request path to the API-server service-proxy subresource:
 	//   /api/v1/namespaces/{ns}/services/[https:]{svc}:{port}/proxy/{sub}
@@ -115,6 +159,35 @@ func (p *ServiceProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.URL.Path = apiBase + "/" + subPath
 	r.URL.RawPath = ""
 	r = r.WithContext(context.WithValue(r.Context(), metaKey, proxyMeta{prefix: prefix, apiBase: apiBase}))
+	rp.ServeHTTP(w, r)
+}
+
+// serveTunnel proxies a request to the service via a port-forward tunnel. The
+// upstream is the app directly (no API-server rewriting), so rewriteResponse
+// runs in prepend-prefix mode (apiBase left empty).
+func (p *ServiceProxy) serveTunnel(w http.ResponseWriter, r *http.Request, ctxName, ns, svc string, port int, subPath, prefix string) {
+	localPort, err := p.tunnels.endpoint(ctxName, ns, svc, port)
+	if err != nil {
+		http.Error(w, "cannot establish port-forward to "+ns+"/"+svc+": "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", localPort)}
+	rp := httputil.NewSingleHostReverseProxy(target)
+	rp.Director = func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = "/" + subPath
+		req.URL.RawPath = ""
+		req.Header.Del("Accept-Encoding") // so we can rewrite bodies
+		req.Host = target.Host
+	}
+	rp.ModifyResponse = rewriteResponse
+	rp.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, e error) {
+		p.tunnels.evict(tunnelKey(ctxName, ns, svc, port)) // tunnel may be dead; rebuild next time
+		http.Error(rw, "tunnel error: "+e.Error(), http.StatusBadGateway)
+	}
+	// Empty apiBase => rewriteResponse uses prepend-prefix HTML mode.
+	r = r.WithContext(context.WithValue(r.Context(), metaKey, proxyMeta{prefix: prefix, apiBase: ""}))
 	rp.ServeHTTP(w, r)
 }
 
@@ -200,7 +273,9 @@ func rewriteResponse(resp *http.Response) error {
 	if cookies := resp.Header.Values("Set-Cookie"); len(cookies) > 0 {
 		rewritten := make([]string, len(cookies))
 		for i, c := range cookies {
-			c = strings.ReplaceAll(c, apiBase, prefix)
+			if apiBase != "" {
+				c = strings.ReplaceAll(c, apiBase, prefix)
+			}
 			c = reCookiePath.ReplaceAllStringFunc(c, func(m string) string {
 				sub := reCookiePath.FindStringSubmatch(m)
 				if strings.HasPrefix(sub[2], prefix) {
@@ -226,7 +301,21 @@ func rewriteResponse(resp *http.Response) error {
 		return err
 	}
 	s := string(body)
-	s = strings.ReplaceAll(s, apiBase, prefix) // API-server-rewritten links -> our prefix
+	if apiBase != "" {
+		// Service-proxy mode: the API server already rewrote absolute links to
+		// start with apiBase; swap that base for our prefix.
+		s = strings.ReplaceAll(s, apiBase, prefix)
+	} else {
+		// Tunnel mode: upstream is the app directly; prepend the prefix to
+		// absolute-path attributes (skip ones already under the prefix).
+		s = reAttrAbsPath.ReplaceAllStringFunc(s, func(m string) string {
+			sub := reAttrAbsPath.FindStringSubmatch(m)
+			if strings.HasPrefix(sub[2], prefix) {
+				return m
+			}
+			return sub[1] + prefix + sub[2]
+		})
+	}
 	s = reAppSubURL.ReplaceAllStringFunc(s, func(m string) string {
 		sub := reAppSubURL.FindStringSubmatch(m)
 		if strings.HasPrefix(sub[2], prefix) {
@@ -245,7 +334,7 @@ func rewriteResponse(resp *http.Response) error {
 // rewriteLocation maps a redirect Location back into our proxy prefix.
 func rewriteLocation(loc, prefix, apiBase string) string {
 	// Already an API-server-relative path -> swap its base for ours.
-	if strings.Contains(loc, apiBase) {
+	if apiBase != "" && strings.Contains(loc, apiBase) {
 		return strings.ReplaceAll(loc, apiBase, prefix)
 	}
 	u, err := url.Parse(loc)

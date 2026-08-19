@@ -25,13 +25,23 @@ spec:
           env:
             - name: LISTEN_ADDR
               value: "0.0.0.0:8770"
-            # Reverse-proxy to in-cluster services over cluster DNS instead of
-            # kubectl port-forward, so browser traffic returns through this one
-            # HTTP port (works behind the ingress).
+            # Reverse-proxy to services through each context's API server, so
+            # browser traffic returns through this one HTTP port (works behind
+            # the ingress) and reaches any cluster the kubeconfig can talk to.
             - name: FORWARD_MODE
               value: "proxy"
+            # Services matching these glob patterns (comma-separated, matched
+            # against "service" or "namespace/service") are reached via a
+            # port-forward tunnel instead of the API server — needed for apps
+            # that use write methods (e.g. Grafana login POST), which the
+            # service-proxy path can't do without Admin RBAC.
+            - name: TUNNEL_SERVICES
+              value: "*grafana*"
             - name: KUBECONFIG
               value: "/etc/kube/config"
+            # Curated UI-service list (ConfigMap). Remove to show all services.
+            - name: SERVICE_CONFIG
+              value: "/etc/peekaboo/services.json"
             # kubectl writes discovery/HTTP cache under $HOME; point it at a
             # writable emptyDir since the root filesystem is read-only.
             - name: HOME
@@ -39,6 +49,9 @@ spec:
           volumeMounts:
             - name: kubeconfig
               mountPath: /etc/kube
+              readOnly: true
+            - name: services
+              mountPath: /etc/peekaboo
               readOnly: true
             - name: cache
               mountPath: /tmp
@@ -74,5 +87,11 @@ spec:
             items:
               - key: config
                 path: config
+        - name: services
+          configMap:
+            name: kube-forwarder-services
+            items:
+              - key: services.json
+                path: services.json
         - name: cache
           emptyDir: {}

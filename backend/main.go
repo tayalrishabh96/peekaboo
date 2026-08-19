@@ -40,8 +40,20 @@ func main() {
 	//   "portforward" — spawn `kubectl port-forward` (correct for local dev)
 	forwardMode := envOr("FORWARD_MODE", "portforward")
 
+	// Optional curated service list (ConfigMap-driven). When set and readable,
+	// only listed UI services are shown for configured namespaces.
+	var svcConfig *kube.ServiceConfig
+	if p := os.Getenv("SERVICE_CONFIG"); p != "" {
+		if c, err := kube.LoadServiceConfig(p); err != nil {
+			log.Printf("service config %s: %v (listing all services)", p, err)
+		} else {
+			svcConfig = c
+			log.Printf("loaded curated service config from %s (%d namespaces)", p, len(c.Namespaces))
+		}
+	}
+
 	mgr := kube.NewForwardManager()
-	api := &API{mgr: mgr, forwardMode: forwardMode}
+	api := &API{mgr: mgr, forwardMode: forwardMode, svcConfig: svcConfig}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/config", api.getConfig)
@@ -52,9 +64,16 @@ func main() {
 	mux.HandleFunc("POST /api/forwards", api.startForward)
 	mux.HandleFunc("DELETE /api/forwards/{id}", api.stopForward)
 
-	// Reverse-proxy endpoint for "proxy" mode.
+	// Reverse-proxy endpoint for "proxy" mode. TUNNEL_SERVICES is a
+	// comma-separated list of glob patterns (matched against "service" or
+	// "namespace/service"); matching services are reached via a port-forward
+	// tunnel (all HTTP methods, no Admin RBAC) instead of the API server.
 	if forwardMode == "proxy" {
-		mux.Handle(kube.ProxyPrefix, kube.NewServiceProxy())
+		tunnelServices := envOr("TUNNEL_SERVICES", "")
+		if tunnelServices != "" {
+			log.Printf("tunneling services matching: %s", tunnelServices)
+		}
+		mux.Handle(kube.ProxyPrefix, kube.NewServiceProxy(tunnelServices))
 	}
 
 	// Serve the embedded frontend (built React app). Falls back to a message
@@ -126,6 +145,7 @@ func withCORS(next http.Handler) http.Handler {
 type API struct {
 	mgr         *kube.ForwardManager
 	forwardMode string
+	svcConfig   *kube.ServiceConfig
 }
 
 // getConfig exposes runtime config the frontend needs, chiefly how the
@@ -177,7 +197,7 @@ func (a *API) listServices(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, fmt.Errorf("context and namespace query params are required"))
 		return
 	}
-	svcs, err := kube.ListServices(ctx, ns)
+	svcs, err := kube.ListServices(ctx, ns, a.svcConfig)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
