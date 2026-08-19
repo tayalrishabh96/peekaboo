@@ -120,6 +120,42 @@ Notes on the manifests:
 - The pod runs as non-root with a read-only root filesystem; `kubectl`'s cache
   goes to an `emptyDir` mounted at `/tmp`.
 
+## Curated service list (`SERVICE_CONFIG`)
+
+By default the service list shows *every* service in a namespace. Since the point
+of this tool is reaching **UIs** (not headless/API/mesh services), you can curate
+the list with a ConfigMap-driven JSON file, pointed to by the `SERVICE_CONFIG`
+env var ([`deploy/configmap.yaml`](deploy/configmap.yaml)). Edit + re-apply the
+ConfigMap and restart the deployment — no image rebuild.
+
+Each entry selects a service by **label** (so it works despite per-cluster Helm
+name prefixes), with optional name filters and a pinned port:
+
+```json
+{
+  "requireEndpoints": true,
+  "namespaces": {
+    "monitoring": [
+      { "name": "grafana",        "labelValue": "grafana" },
+      { "name": "vmalertmanager", "labelValue": "vmalertmanager", "port": 9093 },
+      { "name": "pyroscope",      "labelValue": "pyroscope", "excludeNameContains": ["headless","memberlist"] },
+      { "name": "alloy-cluster",  "labelValue": "alloy", "nameContains": "-alloy-cluster" },
+      { "name": "minio-console",  "labelKey": "app", "labelValue": "minio", "nameContains": "minio-console", "port": 9001 }
+    ]
+  }
+}
+```
+
+- `labelKey` defaults to `app.kubernetes.io/name`; set it (e.g. `app`) for charts
+  that use the legacy label.
+- `nameContains` / `excludeNameContains` disambiguate services that share a label.
+- `port` pins the exposed port (else the service's discovered ports are shown).
+- `requireEndpoints` (default true) drops services with no endpoint IPs — this
+  removes dead/duplicate services automatically (read via the core Endpoints API,
+  so it works with a `view` token that can't read EndpointSlices).
+- The UI shows the friendly `name`; the real service name appears beneath it.
+- Namespaces not listed fall back to showing all their services.
+
 ## How it works
 
 | Endpoint | Purpose |
@@ -161,13 +197,42 @@ This is best-effort: it covers redirects, HTML asset/API links, and cookies, but
 not every URL an SPA may build at runtime (some live/WebSocket features may still
 misbehave). Verified working for Grafana 11.x served this way.
 
+### Tunnel mode for write-heavy apps (`TUNNEL_SERVICES`)
+
+The API-server service-proxy path is subject to **per-method RBAC**: a `GET`
+maps to the `get` verb on `services/proxy`, but a `POST` maps to `create`, which
+many setups (e.g. Devtron) only grant to **Admin**. So with a read-only token you
+can *view* an app but actions like **Grafana login (a POST)** get a 403.
+
+To avoid needing Admin, services can be reached through a **port-forward tunnel**
+instead: peekaboo runs `kubectl port-forward` to the service, binds a local port,
+and reverse-proxies through it. A port-forward needs only the `pods/portforward`
+permission (not Admin) and, once established, passes **all HTTP methods** through
+transparently — so logins and other writes work.
+
+Set the `TUNNEL_SERVICES` env var to a comma-separated list of glob patterns,
+matched against `service` (or `namespace/service` if the pattern contains `/`):
+
+```
+TUNNEL_SERVICES=*grafana*                 # any service whose name contains "grafana"
+TUNNEL_SERVICES=monitoring/*grafana*,foo/bar   # scoped / multiple patterns
+```
+
+Matching services use the tunnel; everything else stays on the stateless
+service-proxy. Tunnels are started lazily, shared across requests for the same
+service, rebuilt if the process dies, and reaped after ~5 minutes idle.
+
 ## Limitations
 
 - **Proxy mode is HTTP/HTTPS only.** The service-proxy subresource speaks HTTP;
   it can't tunnel raw TCP protocols (Postgres, Redis, plain gRPC, etc.).
   Non-HTTP services are listed but won't render usefully when proxied.
 - **Proxy mode needs the `services/proxy` RBAC verb** on the token (see above);
-  the built-in `view` role doesn't include it.
+  the built-in `view` role doesn't include it. Write methods (POST/PUT/…) map to
+  `create`/`update` and often need Admin — use `TUNNEL_SERVICES` for those.
+- **Tunnel mode needs `pods/portforward`** and a service with ready pods; it
+  pins to a single pod (bypassing Service load-balancing) and keeps a
+  `kubectl port-forward` process alive per tunneled service.
 - **Exec-plugin auth isn't supported in proxy mode** — the direct request path
   handles bearer tokens and client certs from the kubeconfig, not `exec`
   credential plugins.

@@ -1,0 +1,36 @@
+# Curated list of UI-serving services to show, per namespace. Edit + re-apply,
+# then restart the deployment to pick it up (no image rebuild).
+#
+# Each entry selects a service by label (labelKey defaults to
+# "app.kubernetes.io/name") plus optional name filters, and optionally pins the
+# port. Services with no endpoint IPs are dropped (requireEndpoints, default
+# true). Namespaces not listed here fall back to showing all services.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-forwarder-services
+data:
+  services.json: |
+    {
+      "requireEndpoints": true,
+      "namespaces": {
+        "monitoring": [
+          { "name": "grafana",            "labelValue": "grafana" },
+          { "name": "vmsingle",           "labelValue": "vmsingle" },
+          { "name": "vmlogs",             "labelValue": "vmlogs" },
+          { "name": "vmalertmanager",     "labelValue": "vmalertmanager", "port": 9093 },
+          { "name": "vmalert",            "labelValue": "vmalert" },
+          { "name": "vmagent",            "labelValue": "vmagent" },
+          { "name": "pyroscope",          "labelValue": "pyroscope", "excludeNameContains": ["headless", "memberlist"] },
+          { "name": "alloy-cluster",      "labelValue": "alloy", "nameContains": "-alloy-cluster" },
+          { "name": "minio-console",      "labelKey": "app", "labelValue": "minio", "nameContains": "minio-console", "port": 9001 },
+          { "name": "blackbox",           "labelValue": "prometheus-blackbox-exporter" },
+          { "name": "kube-state-metrics", "labelValue": "kube-state-metrics" }
+        ],
+        "devtroncd": [
+          { "name": "nats",          "labelValue": "nats", "port": 8222 },
+          { "name": "argocd-server", "labelValue": "argocd-server", "port": 443 },
+          { "name": "orchestrator",  "labelKey": "app", "labelValue": "orchestrator", "excludeNameContains": ["preview"], "port": 80 }
+        ]
+      }
+    }

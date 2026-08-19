@@ -271,9 +271,14 @@ export default function Browse({ onForwardStarted, config }) {
                   onClick={() => setService(svc.name)}
                 >
                   <div className="svc-head">
-                    <span className="row-title">{svc.name}</span>
+                    <span className="row-title">
+                      {svc.displayName || svc.name}
+                    </span>
                     <span className="tag">{svc.type}</span>
                   </div>
+                  {svc.displayName && svc.displayName !== svc.name && (
+                    <span className="row-sub svc-realname">{svc.name}</span>
+                  )}
                   <div className="ports">
                     {(svc.ports?.length ?? 0) === 0 && (
                       <span className="row-sub">no ports</span>

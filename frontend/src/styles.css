@@ -236,6 +236,12 @@ body {
   justify-content: space-between;
   margin-bottom: 6px;
 }
+.svc-realname {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  margin: -2px 0 6px;
+}
 .tag {
   font-size: 11px;
   color: var(--muted);

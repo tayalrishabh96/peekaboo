@@ -117,15 +117,20 @@ type ServicePort struct {
 
 // Service is a k8s service with its ports.
 type Service struct {
-	Name      string        `json:"name"`
-	Namespace string        `json:"namespace"`
-	Type      string        `json:"type"`
-	ClusterIP string        `json:"clusterIP"`
-	Ports     []ServicePort `json:"ports"`
+	Name        string        `json:"name"`
+	DisplayName string        `json:"displayName,omitempty"` // friendly name from curated config
+	Namespace   string        `json:"namespace"`
+	Type        string        `json:"type"`
+	ClusterIP   string        `json:"clusterIP"`
+	Ports       []ServicePort `json:"ports"`
+
+	labels map[string]string // service labels, used for curation (not serialized)
 }
 
-// ListServices lists services in the given context/namespace.
-func ListServices(context, namespace string) ([]Service, error) {
+// ListServices lists services in the given context/namespace. When cfg is
+// non-nil and the namespace is curated, only matching services are returned
+// (and, if configured, services without endpoint IPs are dropped).
+func ListServices(context, namespace string, cfg *ServiceConfig) ([]Service, error) {
 	out, err := runKubectl("--context", context, "-n", namespace, "get", "services", "-o", "json")
 	if err != nil {
 		return nil, err
@@ -133,8 +138,9 @@ func ListServices(context, namespace string) ([]Service, error) {
 	var list struct {
 		Items []struct {
 			Metadata struct {
-				Name      string `json:"name"`
-				Namespace string `json:"namespace"`
+				Name      string            `json:"name"`
+				Namespace string            `json:"namespace"`
+				Labels    map[string]string `json:"labels"`
 			} `json:"metadata"`
 			Spec struct {
 				Type      string `json:"type"`
@@ -159,6 +165,7 @@ func ListServices(context, namespace string) ([]Service, error) {
 			Type:      item.Spec.Type,
 			ClusterIP: item.Spec.ClusterIP,
 			Ports:     []ServicePort{}, // never emit null; some services (e.g. headless) have no ports
+			labels:    item.Metadata.Labels,
 		}
 		for _, p := range item.Spec.Ports {
 			svc.Ports = append(svc.Ports, ServicePort{
@@ -171,5 +178,54 @@ func ListServices(context, namespace string) ([]Service, error) {
 		result = append(result, svc)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
-	return result, nil
+
+	// No curation, or this namespace isn't curated -> return everything.
+	if cfg == nil || cfg.Namespaces[namespace] == nil {
+		return result, nil
+	}
+
+	// Drop services with no endpoint IPs (best-effort; if we can't read
+	// endpoints, skip the filter rather than hide everything).
+	var ready map[string]bool
+	if cfg.requireEndpoints() {
+		if r, err := listReadyServiceNames(context, namespace); err == nil {
+			ready = r
+		}
+	}
+	return cfg.curate(namespace, result, ready), nil
+}
+
+// listReadyServiceNames returns the set of services in the namespace that have
+// at least one endpoint address. Uses the core Endpoints API (not
+// EndpointSlices, which need discovery.k8s.io access a View token lacks).
+func listReadyServiceNames(context, namespace string) (map[string]bool, error) {
+	out, err := runKubectl("--context", context, "-n", namespace, "get", "endpoints", "-o", "json")
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Subsets []struct {
+				Addresses []struct {
+					IP string `json:"ip"`
+				} `json:"addresses"`
+			} `json:"subsets"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(out, &list); err != nil {
+		return nil, fmt.Errorf("parsing endpoints: %w", err)
+	}
+	ready := make(map[string]bool)
+	for _, item := range list.Items {
+		for _, ss := range item.Subsets {
+			if len(ss.Addresses) > 0 {
+				ready[item.Metadata.Name] = true
+				break
+			}
+		}
+	}
+	return ready, nil
 }
