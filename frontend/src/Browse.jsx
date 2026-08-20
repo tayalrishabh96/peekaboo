@@ -124,6 +124,7 @@ export default function Browse({ onForwardStarted, config }) {
   const [context, setContext] = useState(null)
   const [namespace, setNamespace] = useState(null)
   const [service, setService] = useState(null)
+  const [svcFilter, setSvcFilter] = useState('')
 
   const [loading, setLoading] = useState({ ctx: false, ns: false, svc: false })
   const [errors, setErrors] = useState({})
@@ -165,6 +166,7 @@ export default function Browse({ onForwardStarted, config }) {
     setNamespace(name)
     setService(null)
     setServices([])
+    setSvcFilter('')
     setLoading((l) => ({ ...l, svc: true }))
     setErrors((x) => ({ ...x, svc: undefined }))
     api
@@ -271,6 +273,14 @@ export default function Browse({ onForwardStarted, config }) {
         <div className="column">
           <div className="column-head">
             <h2>Services</h2>
+            {services.length > 0 && (
+              <input
+                className="filter"
+                placeholder="Filter…"
+                value={svcFilter}
+                onChange={(e) => setSvcFilter(e.target.value)}
+              />
+            )}
           </div>
           <div className="list">
             {loading.svc && <div className="hint">Loading…</div>}
@@ -282,7 +292,15 @@ export default function Browse({ onForwardStarted, config }) {
               <div className="hint">No services.</div>
             )}
             {!loading.svc &&
-              services.map((svc) => (
+              services
+                .filter((svc) => {
+                  const q = svcFilter.toLowerCase()
+                  return (
+                    (svc.displayName || '').toLowerCase().includes(q) ||
+                    svc.name.toLowerCase().includes(q)
+                  )
+                })
+                .map((svc) => (
                 <div
                   key={svc.name}
                   className={service === svc.name ? 'svc selected' : 'svc'}
