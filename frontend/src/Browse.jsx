@@ -251,10 +251,7 @@ export default function Browse({ onForwardStarted, config }) {
           filterKey={(c) => c.name}
           render={(c) => (
             <>
-              <span className="row-title">
-                {c.name}
-                {c.current && <span className="pill">current</span>}
-              </span>
+              <span className="row-title">{c.name}</span>
               <span className="row-sub">{c.cluster}</span>
             </>
           )}
