@@ -153,6 +153,9 @@ Requires (all one-time infra):
 - **Ingress** rule for host `*.BASE_DOMAIN` → the peekaboo Service (keep your IP
   allowlist on it).
 
+TLS-serving backends (ports 443/6443/8443/9443 — e.g. argocd-server) are dialed
+over HTTPS automatically; otherwise they'd 307-redirect HTTP→HTTPS forever.
+
 Note: slug→service mappings are in-memory. After a pod restart, a cold bookmark
 returns a friendly "re-open from the UI" message until you click the service
 again (which re-registers it).

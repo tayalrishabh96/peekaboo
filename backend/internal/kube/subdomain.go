@@ -2,6 +2,7 @@ package kube
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -91,9 +92,17 @@ func (s *SubdomainProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", localPort)}
+	// TLS-serving backends (argocd-server on 443, etc.) must be dialed over
+	// HTTPS or they 307-redirect HTTP→HTTPS forever. The backend cert is
+	// self-signed and reached via the localhost tunnel, so skip verification.
+	scheme := "http"
+	target := &url.URL{Scheme: scheme, Host: fmt.Sprintf("127.0.0.1:%d", localPort)}
 	reqHost := hostOnly(r.Host)
 	rp := httputil.NewSingleHostReverseProxy(target) // default Director preserves the path verbatim
+	if httpsProxyPorts[t.port] {
+		target.Scheme = "https"
+		rp.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // localhost tunnel to a self-signed backend
+	}
 	rp.ModifyResponse = func(resp *http.Response) error {
 		// Keep absolute redirects on this origin. The app's root_url points at
 		// its real external host; rewrite such Location values to a same-origin
