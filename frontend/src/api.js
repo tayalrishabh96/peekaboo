@@ -25,6 +25,12 @@ export const api = {
     req(
       `/api/services?context=${encodeURIComponent(context)}&namespace=${encodeURIComponent(namespace)}`,
     ),
+  createLink: (payload) =>
+    req('/api/links', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
   listForwards: () => req('/api/forwards'),
   startForward: (payload) =>
     req('/api/forwards', {

@@ -37,6 +37,12 @@ spec:
             # service-proxy path can't do without Admin RBAC.
             - name: TUNNEL_SERVICES
               value: "*grafana*"
+            # Enables subdomain routing: each service opens at
+            # ‹slug›.BASE_DOMAIN, served over a tunnel with its native path
+            # preserved (so SPAs like Grafana work without response rewriting).
+            # Requires wildcard DNS + TLS for *.BASE_DOMAIN.
+            - name: BASE_DOMAIN
+              value: "kube-forwarder.devtron.ai"
             - name: KUBECONFIG
               value: "/etc/kube/config"
             # Curated UI-service list (ConfigMap). Remove to show all services.

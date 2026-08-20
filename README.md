@@ -120,6 +120,43 @@ Notes on the manifests:
 - The pod runs as non-root with a read-only root filesystem; `kubectl`'s cache
   goes to an `emptyDir` mounted at `/tmp`.
 
+## Subdomain routing (`BASE_DOMAIN`) — recommended for SPAs
+
+Apps with a fixed base path and an absolute `root_url` (Grafana, and most SPAs)
+can't be reliably served under a path prefix like `/proxy/…/` — the app hardcodes
+its base (`/grafana`) in HTML, bootData nav JSON, API responses and redirects, and
+no amount of response rewriting keeps all of them consistent (you get doubled
+paths like `/grafana/grafana/…`).
+
+Subdomain routing fixes this by giving each service its **own origin** and
+**preserving the path verbatim**:
+
+```
+https://‹slug›.BASE_DOMAIN/grafana/dashboards
+        └── one service ──┘└── app's native path, untouched ──┘
+```
+
+Set `BASE_DOMAIN` (e.g. `kube-forwarder.devtron.ai`) in proxy mode. Then:
+
+- The apex `BASE_DOMAIN` serves the peekaboo UI/API.
+- Clicking a service calls `POST /api/links` and opens `https://‹slug›.BASE_DOMAIN/`,
+  where `‹slug›` is `‹friendly-name›-‹hash›` (a stable DNS label derived from
+  context+namespace+service+port).
+- That subdomain is routed by Host header to the service over a **port-forward
+  tunnel with the path preserved** — so the app's native `/grafana/…` paths, its
+  `appSubUrl`, assets, API calls and WebSockets all just work. The only rewrite
+  is pulling the app's initial `root_url` redirect back onto the slug origin.
+
+Requires (all one-time infra):
+- **Wildcard DNS** `*.BASE_DOMAIN` → the same ingress/LB as the apex.
+- **Wildcard TLS** `*.BASE_DOMAIN` (e.g. cert-manager DNS-01).
+- **Ingress** rule for host `*.BASE_DOMAIN` → the peekaboo Service (keep your IP
+  allowlist on it).
+
+Note: slug→service mappings are in-memory. After a pod restart, a cold bookmark
+returns a friendly "re-open from the UI" message until you click the service
+again (which re-registers it).
+
 ## Curated service list (`SERVICE_CONFIG`)
 
 By default the service list shows *every* service in a namespace. Since the point

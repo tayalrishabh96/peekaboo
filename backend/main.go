@@ -52,8 +52,14 @@ func main() {
 		}
 	}
 
+	// Base domain for subdomain routing (e.g. kube-forwarder.devtron.ai). When
+	// set (proxy mode), each service is reachable at ‹slug›.BASE_DOMAIN, served
+	// over a tunnel with the path preserved so apps with a fixed base path
+	// (Grafana etc.) work without response rewriting.
+	baseDomain := envOr("BASE_DOMAIN", "")
+
 	mgr := kube.NewForwardManager()
-	api := &API{mgr: mgr, forwardMode: forwardMode, svcConfig: svcConfig}
+	api := &API{mgr: mgr, forwardMode: forwardMode, svcConfig: svcConfig, baseDomain: baseDomain}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/config", api.getConfig)
@@ -76,6 +82,13 @@ func main() {
 		mux.Handle(kube.ProxyPrefix, kube.NewServiceProxy(tunnelServices))
 	}
 
+	// Subdomain routing: ‹slug›.BASE_DOMAIN → service via tunnel, path preserved.
+	if forwardMode == "proxy" && baseDomain != "" {
+		api.subProxy = kube.NewSubdomainProxy(baseDomain)
+		mux.HandleFunc("POST /api/links", api.createLink)
+		log.Printf("subdomain routing enabled under *.%s", baseDomain)
+	}
+
 	// Serve the embedded frontend (built React app). Falls back to a message
 	// when the app hasn't been built yet.
 	if sub, err := fs.Sub(embeddedWeb, "web"); err == nil {
@@ -86,9 +99,22 @@ func main() {
 		}
 	}
 
+	// Dispatch by Host: ‹slug›.BASE_DOMAIN → subdomain proxy; everything else
+	// (the apex UI/API) → the mux.
+	var handler http.Handler = mux
+	if api.subProxy != nil {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := api.subProxy.MatchHost(r.Host); ok {
+				api.subProxy.ServeHTTP(w, r)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		})
+	}
+
 	log.Printf("kube-forwarder listening on http://%s", *addr)
 	log.Printf("reading kubeconfig from %s", kube.ConfigPath())
-	srv := &http.Server{Addr: *addr, Handler: withCORS(mux)}
+	srv := &http.Server{Addr: *addr, Handler: withCORS(handler)}
 	if err := srv.ListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -146,15 +172,44 @@ type API struct {
 	mgr         *kube.ForwardManager
 	forwardMode string
 	svcConfig   *kube.ServiceConfig
+	baseDomain  string
+	subProxy    *kube.SubdomainProxy
 }
 
 // getConfig exposes runtime config the frontend needs, chiefly how the
 // "connect to a service" step should behave.
 func (a *API) getConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"forwardMode": a.forwardMode,
-		"proxyPrefix": kube.ProxyPrefix,
+	writeJSON(w, http.StatusOK, map[string]any{
+		"forwardMode":   a.forwardMode,
+		"proxyPrefix":   kube.ProxyPrefix,
+		"baseDomain":    a.baseDomain,
+		"subdomainMode": a.subProxy != nil,
 	})
+}
+
+// createLink registers a service for subdomain routing and returns its URL.
+func (a *API) createLink(w http.ResponseWriter, r *http.Request) {
+	if a.subProxy == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("subdomain routing is not enabled"))
+		return
+	}
+	var req struct {
+		Context     string `json:"context"`
+		Namespace   string `json:"namespace"`
+		Service     string `json:"service"`
+		Port        int    `json:"port"`
+		DisplayName string `json:"displayName"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Context == "" || req.Namespace == "" || req.Service == "" || req.Port == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("context, namespace, service and port are required"))
+		return
+	}
+	url := a.subProxy.URLFor(req.DisplayName, req.Context, req.Namespace, req.Service, req.Port)
+	writeJSON(w, http.StatusOK, map[string]string{"url": url})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

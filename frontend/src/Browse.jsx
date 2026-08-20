@@ -116,6 +116,7 @@ function NamespaceColumn({
 
 export default function Browse({ onForwardStarted, config }) {
   const proxyMode = config?.forwardMode === 'proxy'
+  const subdomainMode = config?.subdomainMode === true
   const [contexts, setContexts] = useState([])
   const [namespaces, setNamespaces] = useState([])
   const [services, setServices] = useState([])
@@ -189,8 +190,28 @@ export default function Browse({ onForwardStarted, config }) {
   const nsForbidden = errors.ns && /forbidden|403/i.test(errors.ns)
 
   async function startForward(svc, port) {
-    // In proxy mode the app reverse-proxies through the selected cluster's API
-    // server to the service; just open the proxy URL in a new tab.
+    // Subdomain mode: register the service and open its ‹slug›.BASE_DOMAIN URL,
+    // where the app is served over a tunnel with its native path preserved.
+    if (subdomainMode) {
+      setStarting(true)
+      setStartError(null)
+      try {
+        const { url } = await api.createLink({
+          context,
+          namespace,
+          service: svc.name,
+          port: port.port,
+          displayName: svc.displayName || svc.name,
+        })
+        window.open(url, '_blank', 'noopener')
+      } catch (e) {
+        setStartError(e.message)
+      } finally {
+        setStarting(false)
+      }
+      return
+    }
+    // Proxy mode (path-based): open the /proxy/... URL in a new tab.
     if (proxyMode) {
       const prefix = config?.proxyPrefix || '/proxy/'
       const url =
